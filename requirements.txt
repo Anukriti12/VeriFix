@@ -1,0 +1,10 @@
+pillow>=10
+numpy>=1.24
+openai>=1.40
+rank-bm25>=0.2.2
+datasets>=2.19
+tqdm>=4.66
+# optional, for dense retrieval (A2):
+# sentence-transformers>=2.7
+# optional, for the learned A6 ranker (falls back to linear weights if absent):
+# lightgbm>=4.0
