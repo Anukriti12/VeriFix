@@ -110,19 +110,22 @@ class FontClusters:
     def cluster_distance(self, a: int, b: int) -> float:
         return float(1.0 - self.centroids[a] @ self.centroids[b])
 
-    def swap(self, font: str, rnd: random.Random) -> Tuple[Optional[str], float]:
-        """A font from the farthest cluster, and the cosine distance between the two clusters."""
+    def swap(self, font: str, rnd: random.Random, available=None) -> Tuple[Optional[str], float]:
+        """A font from the farthest cluster, and the cosine distance between the two clusters.
+        available(font) -> bool restricts the choice to fonts that can actually be rendered."""
         src = self.cluster_of(font)
         k = self.centroids.shape[0]
         if src is None:
             src = rnd.randrange(k)
         dists = [(self.cluster_distance(src, j), j) for j in range(k) if j != src]
-        dists = [x for x in dists if any(l == x[1] for l in self.labels)]
+        ok = (lambda f: True) if available is None else available
+        dists = [x for x in dists
+                 if any(l == x[1] and ok(f) for f, l in zip(self.fonts, self.labels))]
         if not dists:
             return None, 0.0
         far = max(d for d, _ in dists)
         cands = [j for d, j in dists if d >= far - 1e-9]
         tgt = rnd.choice(cands)
-        pool = sorted((f for f, l in zip(self.fonts, self.labels) if l == tgt and f != font),
+        pool = sorted((f for f, l in zip(self.fonts, self.labels) if l == tgt and f != font and ok(f)),
                       key=lambda f: -self.freq.get(f, 0))[:5]
         return (rnd.choice(pool) if pool else None), far

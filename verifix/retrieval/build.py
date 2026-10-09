@@ -31,9 +31,21 @@ def _prior(Y: Document, fix) -> float:
 
 
 def build_index(designs: List[Document], synthetic: bool = False, seed: int = 1000,
-                clusters: Optional[FontClusters] = None) -> FixIndex:
+                clusters: Optional[FontClusters] = None, y_store=None) -> FixIndex:
+    """y_store(Y) -> reference: if given, each entry's degraded design is stored through it and
+    the reference is kept in meta["y_ref"], so the index can later be re-keyed by the deployed
+    judge (scripts/rekey_index.py)."""
     idx = FixIndex()
     clusters = clusters or FontClusters.fallback()
+    n_entry = 0
+
+    def meta(base, X, Y):
+        nonlocal n_entry
+        n_entry += 1
+        m = dict(base, uid=f"ix{n_entry:06d}", design=X.uid())
+        if y_store is not None:
+            m["y_ref"] = y_store(Y)
+        return m
     for i, X in enumerate(designs):
         for cls in ALL_CLASSES:
             sevs = list(BINS[cls]) if cls in BINS else ["significant" if cls == "style" else "-"]
@@ -47,7 +59,7 @@ def build_index(designs: List[Document], synthetic: bool = False, seed: int = 10
                 fix = restore_recipe(Y, targets)
                 idx.add(Exemplar(defect_class=cls, critique=CRITIQUE[cls], actions=fix,
                                  utility=_prior(Y, fix), source="pi_single",
-                                 meta={"severity": sev, "audit": audit}))
+                                 meta=meta({"severity": sev, "audit": audit}, X, Y)))
     if synthetic:
         for i, X in enumerate(designs):
             for k in (2, 3):
@@ -62,5 +74,5 @@ def build_index(designs: List[Document], synthetic: bool = False, seed: int = 10
                 idx.add(Exemplar(defect_class="+".join(classes),
                                  critique="; ".join(CRITIQUE[c] for c in classes), actions=fix,
                                  utility=_prior(Y, fix), source=f"pi_comp{k}",
-                                 meta={"audit": audit}))
+                                 meta=meta({"audit": audit}, X, Y)))
     return idx

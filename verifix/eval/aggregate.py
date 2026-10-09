@@ -119,4 +119,12 @@ def report(results_dir: str) -> None:
     breakdown("perturbation class", lambda r: r.get("pclasses", []))
     breakdown("severity", lambda r: [s for s in r.get("severities", []) if s not in ("-",)])
     breakdown("number of defects k", lambda r: [f"k={len(r.get('pclasses', []))}"])
-    breakdown("Phi can see the defect", lambda r: [f"phi_visible={r.get('phi_visible')}"])
+    breakdown("whether Phi can see the defect",
+              lambda r: ["Phi sees" if r.get("phi_visible") else "Phi blind"])
+
+    fails = {c: sum(1 for r in data[c] if r.get("judge_parse_ok_turn2") is False) for c in conds}
+    t1 = next(iter(data.values()))
+    t1_fail = sum(1 for r in t1 if r.get("judge_parse_ok_turn1") is False)
+    if t1_fail or any(fails.values()):
+        print("\n=== JUDGE OUTPUT THAT COULD NOT BE PARSED (scored 0; check the model) ===")
+        print(f"turn 1: {t1_fail}/{len(t1)}  " + "  ".join(f"{c}={n}" for c, n in fails.items() if n))

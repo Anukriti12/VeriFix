@@ -14,7 +14,8 @@ met, growing with the size of the violation.
   tilt      : text rotated more than 3 degrees
   bounds    : the fraction of any element's box that falls outside the canvas
   overlap   : text boxes overlapping other text boxes
-  occlusion : text covered by an opaque shape or image drawn above it
+  occlusion : text covered by an opaque shape or image drawn above it (transparent parts of
+              image assets do not count)
 
 What Phi cannot see (report this; it is a result, not a bug): Perturb & Invert perturbations are
 calibrated against the design's OWN intent, not against absolute standards. Shrinking a 40 px
@@ -55,20 +56,69 @@ def _area(b) -> int:
     return max(1, (b[2] - b[0]) * (b[3] - b[1]))
 
 
+_REGION_CACHE: Dict[tuple, Tuple[Any, float]] = {}
+
+
+def _region_stats(doc: Document, u: Dict, box) -> Tuple[Any, float]:
+    """(alpha-weighted mean color, opaque fraction) of element u inside the canvas box `box`.
+    Shapes are solid. Tinted vector shapes use their fill color. Images are sampled from their
+    asset (crop-aware, rotation ignored), so a transparent part of a PNG does not count as
+    being behind or on top of text."""
+    ub = _bbox(u)
+    ix0, iy0, ix1, iy1 = max(box[0], ub[0]), max(box[1], ub[1]), min(box[2], ub[2]), min(box[3], ub[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None, 0.0
+    if u.get("type") == "shape":
+        return prop(u, "fill"), 1.0
+    img = doc.assets.get(prop(u, "asset_id"))
+    if img is None:
+        return (prop(u, "fill") or u.get("avg_color") or u.get("color")), 1.0
+    uw, uh = max(1, ub[2] - ub[0]), max(1, ub[3] - ub[1])
+    c = prop(u, "crop") or [0, 0, 1, 1]
+    rel = ((ix0 - ub[0]) / uw, (iy0 - ub[1]) / uh, (ix1 - ub[0]) / uw, (iy1 - ub[1]) / uh)
+    key = (id(img), tuple(round(v, 3) for v in c), tuple(round(v, 3) for v in rel))
+    if key not in _REGION_CACHE:
+        import numpy as np
+        sw, sh = img.size
+        fx = lambda t: c[0] + t * (c[2] - c[0])
+        fy = lambda t: c[1] + t * (c[3] - c[1])
+        x0, y0 = int(fx(rel[0]) * sw), int(fy(rel[1]) * sh)
+        x1, y1 = max(x0 + 1, int(fx(rel[2]) * sw)), max(y0 + 1, int(fy(rel[3]) * sh))
+        a = np.asarray(img.convert("RGBA").crop((x0, y0, x1, y1)).resize((16, 16)), dtype=float)
+        w = a[..., 3] / 255.0
+        cov = float(w.mean())
+        if w.sum() < 1e-6:
+            col = None
+        else:
+            m = (a[..., :3] * w[..., None]).sum(axis=(0, 1)) / w.sum()
+            col = "#{:02x}{:02x}{:02x}".format(*[int(round(v)) for v in m])
+        if len(_REGION_CACHE) > 200000:
+            _REGION_CACHE.clear()
+        _REGION_CACHE[key] = (col, cov)
+    col, cov = _REGION_CACHE[key]
+    if u.get("tint") and prop(u, "fill"):
+        col = prop(u, "fill")
+    return col, cov
+
+
 def _bg_behind(doc: Document, idx: int) -> Any:
     """Color behind text element idx: the topmost non-text element BELOW it (earlier in z-order)
-    whose box contains the text center and whose color is known, else the canvas background.
-    Known limitation: photos and gradients have no single color; their stored mean color is used."""
+    that is mostly opaque under the text box, else the canvas background. For photos and
+    gradients the alpha-weighted mean color of the covered region is used."""
     e = doc.elements[idx]
-    x0, y0, x1, y1 = _bbox(e)
-    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    box = _bbox(e)
+    cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
     best = None
     for u in doc.elements[:idx]:
         if u.get("type") == "text":
             continue
-        bx0, by0, bx1, by1 = _bbox(u)
-        col = prop(u, "fill") if u.get("type") == "shape" else u.get("color")
-        if bx0 <= cx <= bx1 and by0 <= cy <= by1 and col is not None:
+        ub = _bbox(u)
+        if not (ub[0] <= cx <= ub[2] and ub[1] <= cy <= ub[3]):
+            continue
+        if float(prop(u, "opacity") if prop(u, "opacity") is not None else 1.0) < 0.5:
+            continue
+        col, cov = _region_stats(doc, u, box)
+        if col is not None and cov >= 0.5:
             best = col
     return best if best is not None else doc.background
 
@@ -100,7 +150,10 @@ def design_penalty(doc: Document) -> Tuple[float, Dict[str, float]]:
                 continue
             if float(prop(u, "opacity") if prop(u, "opacity") is not None else 1) < OCCLUDER_MIN_OPACITY:
                 continue
-            b["occlusion"] += _inter(box, _bbox(u)) / _area(box)
+            inter = _inter(box, _bbox(u))
+            if inter:
+                _, cov = _region_stats(doc, u, box)
+                b["occlusion"] += cov * inter / _area(box)
 
     for e in doc.elements:
         box = _bbox(e)

@@ -24,15 +24,18 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from ..agents.judge import JUDGE_DIMS, critique_text
+from ..agents.judge import critique_text, present_dims
 from ..agents.verifier import (format_for_planner, log_summary, verify, verify_against_truth)
 from ..core.design import Document
 from ..core.metrics import collateral, exact_rate, perceptual_distance, quality
 from ..core.objective import design_penalty
 from ..core.tools import execute_actions
 from ..perturb.operators import restore_recipe
-from ..retrieval import dense, outcome, sparse
+from ..retrieval import dense, hybrid, outcome, sparse
 from ..retrieval.index import FixIndex, detect_defects
+from ..retrieval.select import filter_applicable, mmr
+
+RETRIEVERS = ("sparse", "dense", "rrf", "outcome", "learned", "oracle")
 
 COMPILE = {"M1", "M2", "M3", "M4", "ceiling"}
 VERIFY = {"M2", "M3", "M4"}
@@ -53,38 +56,70 @@ class Pipeline:
     def __init__(self, planner, judge, compiler=None, index: Optional[FixIndex] = None,
                  max_passes: int = 3, judge_threshold: float = 1.0, retriever: str = "learned",
                  lam: float = 0.5, embed_client=None, key_mode: str = "both",
-                 learned_ranker=None, top_k: int = 3):
+                 learned_ranker=None, top_k: int = 3, applicability_filter: bool = True,
+                 use_mmr: bool = True, mmr_lambda: float = 0.7, oracle_pool: int = 10):
         self.planner, self.judge, self.compiler, self.index = planner, judge, compiler, index
         self.max_passes, self.judge_threshold = max_passes, judge_threshold
         self.retriever, self.lam, self.embed_client = retriever, lam, embed_client
         self.key_mode, self.learned_ranker, self.top_k = key_mode, learned_ranker, top_k
+        self.applicability_filter, self.use_mmr, self.mmr_lambda = applicability_filter, use_mmr, mmr_lambda
+        self.oracle_pool = oracle_pool
 
     # ------------------------------------------------------------ retrieval (M3/M4)
-    def retrieve(self, jr: Dict):
+    def candidates(self, jr: Dict, D: Optional[Document] = None):
+        """Detected defect classes -> index entries of those classes -> applicability filter."""
         if not self.index:
-            return "", []
+            return []
         defects = detect_defects(jr)
         cands = self.index.candidates(defects) if defects else []
+        if cands and D is not None and self.applicability_filter:
+            cands = filter_applicable(cands, D)
+        return cands
+
+    def rank(self, crit: str, cands: List, n: int):
+        km = self.key_mode
+        if self.retriever == "sparse":
+            return sparse.rank(crit, cands, top_k=n, key_mode=km)
+        if self.retriever == "dense":
+            return dense.rank(crit, cands, top_k=n, client=self.embed_client, key_mode=km)
+        if self.retriever == "rrf":
+            return hybrid.rank(crit, cands, top_k=n, client=self.embed_client, key_mode=km)
+        if self.retriever == "outcome":
+            return outcome.rank(crit, cands, top_k=n, lam=self.lam, key_mode=km)
+        return (self.learned_ranker or _default_learned()).rank(crit, cands, top_k=n, key_mode=km)
+
+    def retrieve(self, jr: Dict, D: Optional[Document] = None, query: str = "",
+                 targets: Optional[List[Dict]] = None, base_block: str = ""):
+        """Return (text block for the planner, [(critique, exemplar), ...] injected)."""
+        cands = self.candidates(jr, D)
         if not cands:
             return "", []
-        crit, km, k = critique_text(jr), self.key_mode, self.top_k
-        if self.retriever == "sparse":
-            ranked = sparse.rank(crit, cands, top_k=k, key_mode=km)
-        elif self.retriever == "dense":
-            ranked = dense.rank(crit, cands, top_k=k, client=self.embed_client, key_mode=km)
-        elif self.retriever == "outcome":
-            ranked = outcome.rank(crit, cands, top_k=k, lam=self.lam, key_mode=km)
+        crit = critique_text(jr)
+        if self.retriever == "oracle":
+            ranked = self.oracle_rank(crit, cands, D, query, targets, base_block)
         else:
-            ranked = (self.learned_ranker or _default_learned()).rank(crit, cands, top_k=k, key_mode=km)
+            pool = len(cands) if self.use_mmr else self.top_k
+            ranked = self.rank(crit, cands, pool)
+            ranked = mmr(ranked, self.top_k, self.mmr_lambda) if self.use_mmr else ranked[: self.top_k]
         if not ranked:
             return "", []
-        lines = ["## KNOWN GOOD FIXES (from similar past cases; adapt the values to this design)"]
-        for _, ex in ranked:
-            lines.append(f"- for: {ex.critique} (measured gain {ex.utility:+.2f})")
-            for a in ex.actions[:3]:
-                params = ", ".join(f"{p}={v}" for p, v in (a.get("params") or {}).items())
-                lines.append(f"    {a['action']}: {params}")
-        return "\n".join(lines), [(crit, ex) for _, ex in ranked]
+        return fix_block([ex for _, ex in ranked]), [(crit, ex) for _, ex in ranked]
+
+    def oracle_rank(self, crit, cands, D, query, targets, base_block):
+        """NOT DEPLOYABLE (uses the answer key). Give the planner each shortlisted fix on its own,
+        measure the true gain on THIS case, and rank by it. The shortlist is the top
+        oracle_pool entries by BM25, so the oracle ranks the same pool a cheap ranker sees."""
+        if D is None or targets is None:
+            raise ValueError("oracle retriever needs the design and targets")
+        short = sparse.rank(crit, cands, top_k=self.oracle_pool, key_mode=self.key_mode)
+        q1 = quality(D, targets)
+        scored = []
+        for _, ex in short:
+            blk = (base_block + "\n\n" if base_block else "") + fix_block([ex])
+            acts = self.planner.plan(D, query, extra_block=blk)
+            scored.append((quality(execute_actions(D, acts), targets) - q1, ex))
+        scored.sort(key=lambda x: -x[0])
+        return scored[: self.top_k]
 
     # ------------------------------------------------------------ one feedback step
     def feedback_step(self, D: Document, jr: Dict, query: str, condition: str,
@@ -96,14 +131,14 @@ class Pipeline:
         if condition == "B1":
             fb = jr["feedback_text"]
         elif condition == "B2":
-            fb = jr["feedback_text"] + "\n\nSuggested steps:\n" + judge_steps(self.judge, D, jr)
+            fb = jr["feedback_text"] + "\n\nSuggested steps:\n" + judge_steps(self.judge, D, jr, query)
         elif condition == "B3":
             fb = "Your own critique of the current design:\n" + self_critique(self.planner, D)
         elif condition == "B4":
             fb = jr["feedback_text"]
             extra = "## YOUR REFLECTION\n" + (memory or reflect(self.planner, D, jr["feedback_text"]))
         elif condition in COMPILE:
-            proposals = self.compiler.compile(D, jr) if self.compiler else []
+            proposals = self.compiler.compile(D, jr, query) if self.compiler else []
             if condition == "ceiling":
                 kept, vlog = verify_against_truth(D, proposals, X, targets or [])
             elif condition in VERIFY:
@@ -116,7 +151,7 @@ class Pipeline:
             else:
                 extra = format_for_planner(kept, D)
             if condition in RETRIEVE:
-                blk, injected = self.retrieve(jr)
+                blk, injected = self.retrieve(jr, D, query, targets, base_block=extra)
                 if blk:
                     extra += "\n\n" + blk
         elif condition == "oracle":
@@ -172,7 +207,8 @@ class Pipeline:
     def _result(self, condition, Y, D1, D2, jr1, jr2, targets, X, step, n_turns) -> Dict:
         out = {"condition": condition, "n_turns": n_turns,
                "judge_turn1": jr1["overall"], "judge_turn2": jr2["overall"],
-               "judge_scores_turn2": {d: jr2[d]["score"] for d in JUDGE_DIMS},
+               "judge_scores_turn2": {d: jr2[d]["score"] for d in present_dims(jr2)},
+               "judge_parse_ok_turn2": jr2.get("parse_ok", True),
                "phi_turn1": round(design_penalty(D1)[0], 4),
                "phi_turn2": round(design_penalty(D2)[0], 4),
                "verifier": step.get("verifier", {}), "n_edits_turn2": len(step.get("actions", [])),
@@ -190,14 +226,27 @@ class Pipeline:
         return out
 
 
+def fix_block(exemplars) -> str:
+    """How retrieved fixes are shown to the planner (element ids are omitted: they belong to
+    another design; the planner adapts the values to this one)."""
+    lines = ["## KNOWN GOOD FIXES (from similar past cases; adapt the values to this design)"]
+    for ex in exemplars:
+        lines.append(f"- for: {ex.critique} (measured gain {ex.utility:+.2f})")
+        for a in ex.actions[:3]:
+            params = ", ".join(f"{p}={v}" for p, v in (a.get("params") or {}).items())
+            lines.append(f"    {a['action']}: {params}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- helper model calls
-def judge_steps(judge, doc, jr) -> str:
+def judge_steps(judge, doc, jr, query: str = "") -> str:
     from ..agents.llm_client import chat
     from ..core.render import render
     sys = ("You are the same design judge. Given your critique, write a short numbered list of "
            "imperative fix steps a designer should take. Plain text, no JSON.")
-    crit = "\n".join(f"{d}: {jr.get(d, {}).get('explanation', '')}" for d in JUDGE_DIMS)
-    return chat(judge.client, judge.model, sys, f"Critique:\n{crit}",
+    crit = "\n".join(f"{d}: {jr.get(d, {}).get('explanation', '')}" for d in present_dims(jr))
+    req = f'User request: "{query}"\n' if query else ""
+    return chat(judge.client, judge.model, sys, f"{req}Critique:\n{crit}",
                 images=[render(doc, marked=False, fonts_dir=judge.fonts_dir)],
                 counter=judge.counter, temperature=0.2, max_tokens=400)
 

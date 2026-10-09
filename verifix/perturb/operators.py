@@ -20,8 +20,8 @@ Every perturbation is applied as a real tool call, so it is executable and its i
 of tool calls. Targets (what the agent must restore) are read off structural_diff(Y, X), so they
 always match exactly what changed; reorder_layer contributes a z target for the moved element.
 
-The user request is DEFECT-AGNOSTIC by default (REPAIR_REQUEST): the critique, not the request,
-must reveal what is wrong. Defect-specific requests (P&I-style) are available for ablations.
+The user request is the INVERSE of the damage in words (perturb/requests.py), as in Perturb &
+Invert: e.g. 'Make the text "SUMMER FEST" larger.' The generic REPAIR_REQUEST is an ablation.
 """
 from __future__ import annotations
 
@@ -96,7 +96,14 @@ def _texts(doc: Document) -> List[Dict]:
 
 
 def _images(doc: Document) -> List[Dict]:
-    return [e for e in doc.elements if e.get("type") == "image"]
+    """Photo-like image elements. Tinted vector shapes (single-color SVGs) are excluded from
+    image tools that only make sense on pictures (replace, crop, filter)."""
+    return [e for e in doc.elements if e.get("type") == "image" and not e.get("tint")]
+
+
+def _available_fonts(fonts: List[str]) -> List[str]:
+    from ..core.render import font_available
+    return [f for f in fonts if font_available(f)]
 
 
 def _call(action: str, target: str, **params) -> Dict:
@@ -215,7 +222,8 @@ def p_style(doc, rnd, severity="significant", clusters: Optional[FontClusters] =
         return None, [], {}
     e = rnd.choice(texts)
     old = prop(e, "font")
-    new, dist = clusters.swap(old, rnd)
+    from ..core.render import font_available
+    new, dist = clusters.swap(old, rnd, available=font_available)
     if not new:
         return None, [], {}
     Y = _apply(doc, _call("change_font", e["id"], family=new))
@@ -238,7 +246,9 @@ def p_tool(doc, rnd, tool: str, clusters: Optional[FontClusters] = None, **_) ->
         return _apply(doc, _call(tool, e["id"], color=new)), [_call(tool, e["id"], color=old)], {}
     if tool == "change_font" and texts:
         e = pick(texts); old = prop(e, "font") or "Arial"
-        pool = [f for f in (clusters or FontClusters.fallback()).fonts if f != old]
+        pool = [f for f in _available_fonts((clusters or FontClusters.fallback()).fonts) if f != old]
+        if not pool:
+            return None, [], {}
         new = pick(pool)
         return _apply(doc, _call(tool, e["id"], family=new)), [_call(tool, e["id"], family=old)], {}
     if tool == "resize_text" and texts:
@@ -255,8 +265,9 @@ def p_tool(doc, rnd, tool: str, clusters: Optional[FontClusters] = None, **_) ->
         f = pick([rnd.uniform(0.55, 0.8), rnd.uniform(1.25, 1.5)])
         new = [l, t, max(1, int(w * f)), max(1, int(h / f))]
         return _apply(doc, _call(tool, e["id"], bbox=new)), [_call(tool, e["id"], bbox=[l, t, w, h])], {}
-    if tool == "recolor_image" and (images or [e for e in els if e.get("type") == "shape"]):
-        e = pick(images or [e for e in els if e.get("type") == "shape"])
+    recolorable = [e for e in els if e.get("type") in ("image", "shape")]
+    if tool == "recolor_image" and recolorable:
+        e = pick(recolorable)
         oh, os_ = float(prop(e, "hue_shift") or 0), float(prop(e, "sat_scale") or 1)
         nh = oh + pick([-1, 1]) * rnd.uniform(40, 150)
         ns = pick([rnd.uniform(0.3, 0.6), rnd.uniform(1.5, 2.0)])
@@ -264,7 +275,8 @@ def p_tool(doc, rnd, tool: str, clusters: Optional[FontClusters] = None, **_) ->
                 [_call(tool, e["id"], hue=oh, sat=os_)], {})
     if tool == "replace_image" and images and len(doc.assets) >= 2:
         e = pick(images); old = prop(e, "asset_id")
-        others = [a for a in doc.assets if a != old]
+        masks = {prop(x, "asset_id") for x in els if x.get("tint")}   # SVG alpha masks
+        others = sorted(a for a in doc.assets if a != old and a not in masks)
         if others:
             new = pick(others)
             return _apply(doc, _call(tool, e["id"], asset=new)), [_call(tool, e["id"], asset=old)], {}
@@ -359,7 +371,7 @@ def apply_spec(X: Document, spec: List[Tuple[str, str]], rnd: random.Random,
         inverse = inv + inverse                       # undo in reverse order
         if "z_target" in audit:
             z_targets.append(audit.pop("z_target"))
-        audits.append({"class": cls, "severity": sev, **audit})
+        audits.append({"class": cls, "severity": sev, **audit, "inverse": inv})
     targets = targets_from_diff(Y, X, z_targets)
     return Y, targets, inverse, audits
 

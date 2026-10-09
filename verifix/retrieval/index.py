@@ -101,12 +101,13 @@ class FixIndex:
 # --------------------------------------------------------------------------- #
 # Judge critique -> defect classes (deployable; no ground truth used)
 # --------------------------------------------------------------------------- #
-DIMS = ("layout", "typography", "color")   # must match agents/judge.JUDGE_DIMS
+DIMS = ("request", "layout", "typography", "color")   # must match agents/judge.JUDGE_DIMS
 
 _KEYWORDS = {
     "style": ["typeface", "font does not", "font doesn't", "font choice", "mismatched font",
               "font style", "decorative font", "inconsistent font", "font clash", "wrong font"],
-    "readability_size": ["too small", "tiny", "small text", "illegible", "hard to read", "size"],
+    "readability_size": ["too small", "tiny", "small text", "illegible", "hard to read", "size",
+                         "larger", "bigger"],
     "readability_contrast": ["contrast", "faint", "washed", "blends", "against the background",
                              "hard to see", "low visibility"],
     "palette": ["palette", "colors clash", "colours clash", "color scheme", "hue", "inconsistent color"],
@@ -119,10 +120,11 @@ _KEYWORDS = {
     "apply_filter": ["filter", "grayscale", "sepia", "blurry", "blurred", "inverted"],
     "reposition": ["position", "misplaced", "off-center", "misaligned"],
     "resize_element": ["too big", "scaled", "proportion", "oversized"],
-    "rotate": ["tilt", "rotated", "angle", "crooked", "slanted", "skew"],
+    "rotate": ["tilt", "rotated", "angle", "crooked", "slanted", "skew", "straighten"],
     "reorder_layer": ["hidden", "behind", "covered", "obscured", "layer"],
-    "duplicate_elem": ["duplicate", "repeated", "twice", "copy"],
-    "add_shape": ["stray shape", "shape", "block", "clutter", "unnecessary element"],
+    "duplicate_elem": ["duplicate", "repeated", "twice", "copy", "extra copy"],
+    "add_shape": ["stray shape", "shape", "block", "clutter", "unnecessary element",
+                  "does not belong"],
     "change_bg": ["background color", "background colour", "background"],
     "apply_effect": ["shadow", "outline", "glow", "effect"],
     "adj_contrast": ["overall contrast", "flat", "harsh"],
@@ -134,8 +136,8 @@ def detect_defects(judge_result: Dict) -> List[str]:
     """Map the judge's failing dimensions and explanations to defect classes (recall-oriented)."""
     hits: List[str] = []
     for dim in DIMS:
-        d = judge_result.get(dim, {})
-        if float(d.get("score", 1)) >= 1:
+        d = judge_result.get(dim)
+        if not isinstance(d, dict) or float(d.get("score", 1)) >= 1:
             continue
         expl = str(d.get("explanation", "")).lower()
         for cls, kws in _KEYWORDS.items():

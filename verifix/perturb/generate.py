@@ -32,6 +32,7 @@ from ..core.render import render
 from ..core.tools import execute_actions
 from .coverage import greedy_cover
 from .fonts import FontClusters
+from .requests import build_request
 from .operators import (BINS, METADATA_CLASSES, SEVERITIES, TOOL_CLASSES, apply_spec, query_for,
                         restore_recipe)
 
@@ -95,7 +96,7 @@ def _violates(audit: List[Dict]) -> bool:
 
 
 def certify(X: Document, Y: Document, targets: List[Dict], inverse: List[Dict],
-            audit: List[Dict], fonts_dir: str = "fonts") -> Dict:
+            audit: List[Dict], fonts_dir=None) -> Dict:
     invertible = len(structural_diff(execute_actions(Y, inverse), X)) == 0
     oracle_ok = len(structural_diff(execute_actions(Y, restore_recipe(Y, targets)), X)) == 0
     violates = bool(targets) and _violates(audit)
@@ -123,8 +124,8 @@ def sample_spec(rnd: random.Random, k: int, mix: str = "both") -> List[Tuple[str
 
 
 def make_datapoint(X: Document, spec: List[Tuple[str, str]], seed: int,
-                   clusters: Optional[FontClusters] = None, query_mode: str = "generic",
-                   fonts_dir: str = "fonts") -> Optional[DataPoint]:
+                   clusters: Optional[FontClusters] = None, query_mode: str = "inverse",
+                   fonts_dir=None) -> Optional[DataPoint]:
     out = apply_spec(X, spec, random.Random(seed), clusters)
     if out is None:
         return None
@@ -132,17 +133,19 @@ def make_datapoint(X: Document, spec: List[Tuple[str, str]], seed: int,
     classes = [c for c, _ in spec]
     cert = certify(X, Y, targets, inverse, audit, fonts_dir)
     return DataPoint(X=X, Y=Y, targets=targets, inverse=inverse, pclasses=classes,
-                     severities=[s for _, s in spec], query=query_for(classes, query_mode),
+                     severities=[s for _, s in spec], query=build_request(audit, X, Y, query_mode),
                      audit=audit, certificate=cert)
 
 
 def generate(designs: List[Document], k_range=(1, 3), seed: int = 42, mix: str = "both",
              sampler: str = "random", pool_per_design: int = 4,
-             clusters: Optional[FontClusters] = None, query_mode: str = "generic",
-             keep_only_certified: bool = True, fonts_dir: str = "fonts",
-             max_tries: int = 8) -> List[DataPoint]:
+             clusters: Optional[FontClusters] = None, query_mode: str = "inverse",
+             keep_only_certified: bool = True, fonts_dir=None,
+             max_tries: int = 8, stratify_k: bool = True) -> List[DataPoint]:
     """One datapoint per design. sampler="coverage" draws pool_per_design candidates per design
-    and keeps the subset that greedily maximizes class-pair coverage (one per design)."""
+    and keeps the subset that greedily maximizes class-pair coverage (one per design).
+    stratify_k=True gives design i exactly k = lo + (i mod (hi-lo+1)) defects, so the set has
+    equal shares of k=1, 2, 3 (coverage selection alone would pick k=3 almost always)."""
     lo, hi = k_range
     clusters = clusters or FontClusters.fallback()
     cands: List[DataPoint] = []
@@ -155,7 +158,8 @@ def generate(designs: List[Document], k_range=(1, 3), seed: int = 42, mix: str =
             if made >= n_per:
                 break
             rnd = random.Random(seed * 100003 + i * 1009 + t)
-            spec = sample_spec(rnd, rnd.randint(lo, hi), mix)
+            k = lo + (i % (hi - lo + 1)) if stratify_k else rnd.randint(lo, hi)
+            spec = sample_spec(rnd, k, mix)
             dp = make_datapoint(X, spec, seed + i * 7919 + t, clusters, query_mode, fonts_dir)
             if dp is None:
                 continue

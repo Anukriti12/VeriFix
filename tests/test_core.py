@@ -94,7 +94,9 @@ def test_every_class_is_invertible_and_scored():
                 assert c["invertible"] and c["oracle_recipe_exact"], (cls, sev, c)
                 assert abs(quality(dp.Y, dp.targets)) < 1e-9, (cls, quality(dp.Y, dp.targets))
                 assert quality(execute_actions(dp.Y, dp.inverse), dp.targets) == 1.0
-                assert dp.query == REPAIR_REQUEST
+                assert dp.query != REPAIR_REQUEST and "Keep everything else" in dp.query, dp.query
+                g = make_datapoint(X, [(cls, sev)], seed=i, query_mode="generic", fonts_dir=FONTS)
+                assert g is None or g.query == REPAIR_REQUEST
                 n_ok += 1
             assert n_ok > 0, f"{cls}:{sev} never applicable on synthetic designs"
     print(f"ok: all {len(ALL_CLASSES)} classes invert exactly; Q(Y)=0, Q(inverse)=1; request is defect-agnostic")
@@ -363,6 +365,113 @@ def test_aggregate_reports_paired_gain():
     json.dump([row(i, 0.2, 1.0, "oracle") for i in range(5)], open(os.path.join(d, "results_oracle.json"), "w"))
     report(d)
     print("ok: aggregate prints dQ with bootstrap CI, go/no-go, OracleHeadroom, verifier stats")
+
+
+# ----------------------------------------------------------------------------- Crello loader
+def test_parse_color_formats():
+    from verifix.core.color import parse_color
+    assert parse_color("#FFF") == ("#ffffff", 1.0)
+    assert parse_color("rgba(255, 0, 0, 0.5)") == ("#ff0000", 0.5)
+    assert parse_color("rgb(10%, 20%, 30%)")[0] == "#1a334d"
+    assert parse_color([0, 128, 255]) == ("#0080ff", 1.0)
+    assert parse_color([0.0, 0.5, 1.0])[0] == "#0080ff"
+    assert parse_color("#11223380")[1] == 128 / 255
+    assert parse_color("not a color") is None and parse_color(None) is None
+    print("ok: dataset color strings parse (hex, rgb(), rgba(), lists)")
+
+
+def test_crello_loader_on_v5_schema():
+    """The real loader code path (datasets + parquet + class labels) on a fixture in the v5 schema."""
+    import tempfile
+    from tests.crello_fixture import write
+    from verifix.domains.graphic_design import GraphicDesignDomain, _with_line_breaks
+    d = tempfile.mkdtemp()
+    write(d, n=4)
+    # without font files every design would be dropped as "missing font"; fetch_fonts fixes that
+    dom = GraphicDesignDomain(data_dir=d, allow_synthetic=False, require_fonts=HAVE_FONTS)
+    docs = dom.load(3, split="test")
+    assert len(docs) == 3 and dom.last_stats["kept"] == 3
+    x = docs[0]
+    assert x.width in (800, 1080) and x.background.startswith("#")
+    texts = [e for e in x.elements if e["type"] == "text"]
+    assert len(texts) == 2 and texts[0]["font_weight"] == "bold" and "\n" in texts[0]["text"]
+    assert all(e["left"] > 1 and e["width"] > 1 for e in x.elements), "geometry must be pixels"
+    tint = [e for e in x.elements if e.get("tint")]
+    assert tint and tint[0]["fill"].startswith("#"), "single-color SVG becomes a tinted shape"
+    assert not any(e.get("type") == "image" and e.get("left") == 0 and e.get("width") == x.width
+                   for e in x.elements), "flat ColoredBackground becomes the canvas color"
+    assert x.metadata["render_diff"] < 0.01
+    skipped = dom.load(2, split="test", skip=1)
+    assert skipped[0].metadata["crello_id"] == docs[1].metadata["crello_id"], "skip gives disjoint subsets"
+    assert _with_line_breaks("Hello big world", [0] * 6 + [1] * 9) == "Hello\nbig world"
+    print("ok: Crello v5 loader: pixels, degrees, text_color, bold, line breaks, tint, background, skip")
+
+
+def test_crello_v4_geometry_is_rescaled():
+    from verifix.domains.graphic_design import crello_to_doc
+    rec = {"canvas_width": 1000, "canvas_height": 500, "type": ["TextElement"], "left": [0.1],
+           "top": [0.2], "width": [0.5], "height": [0.1], "angle": [0.5], "text": ["Hi"],
+           "font": ["Roboto"], "font_size": [20.0]}
+    e = crello_to_doc(rec, None, 0, "test", revision="4.0.0").elements[0]
+    assert (e["left"], e["top"], e["width"]) == (100, 100, 500) and abs(e["angle"] - 28.6479) < 1e-3
+    print("ok: v4 normalized geometry and radians are converted")
+
+
+def test_font_names_and_styles():
+    from verifix.core.render import font_available, split_family_weight
+    assert split_family_weight("Montserrat Bold Italic") == ("Montserrat", "700", True)
+    assert split_family_weight("Open Sans") == ("Open Sans", None, False)
+    assert split_family_weight("Roboto Semi Bold")[1] == "600"
+    if font_available("Roboto"):
+        assert font_available("Roboto Bold")
+    print("ok: font names split into family, weight, italic")
+
+
+def test_phi_ignores_transparent_parts_of_images():
+    from PIL import Image
+    from verifix.core.design import Document
+    from verifix.core.objective import design_penalty, _bg_behind
+    ring = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    for x in range(100):
+        for y in list(range(5)) + list(range(95, 100)):
+            ring.putpixel((x, y), (0, 0, 0, 255))
+    els = [{"id": "t", "type": "text", "text": "Hi", "color": "#ffffff", "font_size": 40,
+            "left": 30, "top": 30, "width": 40, "height": 40},
+           {"id": "frame", "type": "image", "asset_id": "frame", "left": 0, "top": 0,
+            "width": 100, "height": 100}]
+    d = Document(100, 100, "#111111", els, {"frame": ring})
+    assert design_penalty(d)[1]["occlusion"] == 0.0, "a transparent frame does not occlude"
+    d2 = Document(100, 100, "#111111", list(reversed(els)), {"frame": ring})
+    assert _bg_behind(d2, 1) == "#111111", "text over a transparent region sees the canvas"
+    print("ok: Phi samples image alpha for occlusion and background color")
+
+
+def test_applicability_filter_and_mmr():
+    from verifix.core.design import Document
+    from verifix.retrieval.index import Exemplar
+    from verifix.retrieval.select import applicable, mmr
+    only_text = Document(100, 100, "#fff", [{"id": "a", "type": "text", "text": "x"}])
+    crop = Exemplar("crop_image", "cropped", [{"action": "crop_image", "target": "e", "params": {"bbox": [0, 0, 1, 1]}}])
+    font = Exemplar("style", "font", [{"action": "change_font", "target": "e", "params": {"family": "Lora"}}])
+    bg = Exemplar("change_bg", "bg", [{"action": "change_bg", "target": "canvas", "params": {"color": "#fff"}}])
+    assert not applicable(crop, only_text) and applicable(font, only_text) and applicable(bg, only_text)
+    font2 = Exemplar("style", "font 2", [{"action": "change_font", "target": "e", "params": {"family": "Oswald"}}])
+    picked = mmr([(1.0, font), (0.95, font2), (0.6, bg)], k=2, lam=0.5)
+    assert [e.defect_class for _, e in picked] == ["style", "change_bg"], "MMR prefers a different fix"
+    print("ok: applicability filter drops impossible fixes; MMR diversifies the top-k")
+
+
+def test_model_output_parsing():
+    from verifix.agents.judge import _parse, finalize
+    from verifix.agents.planner import parse_calls
+    calls = parse_calls('<think>maybe [x]</think> Here: ```json\n[{"action": "rotate", "target": "1", '
+                        '"params": {"deg": -4}}]\n``` done')
+    assert calls == [{"action": "rotate", "target": "1", "params": {"deg": -4}}]
+    r = finalize(_parse('Sure. {"layout": {"score": "0.5", "explanation": "a"}, '
+                        '"typography": {"score": 1}, "color": {"score": 0.4, "explanation": "b"}}'))
+    assert r["parse_ok"] and r["layout"]["score"] == 0.5 and r["color"]["score"] == 0.5
+    assert _parse("no json here")["parse_ok"] is False
+    print("ok: tool calls and judge JSON are extracted from messy model replies")
 
 
 if __name__ == "__main__":

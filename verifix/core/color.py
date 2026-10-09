@@ -140,3 +140,48 @@ def ciede2000(c1: Any, c2: Any) -> float:
 
 def is_hex_color(v: Any) -> bool:
     return isinstance(v, str) and v.strip().startswith("#") and len(v.strip()) in (4, 7)
+
+
+# ---------------------------------------------------------------- parsing (dataset colors)
+def parse_color(value: Any):
+    """Parse a color as datasets store it: "#rgb", "#rrggbb", "#rrggbbaa", "rgb(r,g,b)",
+    "rgba(r,g,b,a)", or a list/tuple of 3-4 numbers (0-255, or 0-1 floats).
+    Returns ("#rrggbb", alpha in [0,1]) or None when the value is not a color."""
+    import re
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) < 3:
+            return None
+        try:
+            nums = [float(v) for v in value[:4]]
+        except Exception:
+            return None
+        if all(0.0 <= v <= 1.0 for v in nums[:3]) and any(0.0 < v < 1.0 for v in nums[:3]):
+            nums = [v * 255.0 for v in nums[:3]] + nums[3:]
+        a = nums[3] if len(nums) > 3 else 1.0
+        if a > 1.0:
+            a = a / 255.0
+        return to_hex([int(v + 0.5) for v in nums[:3]]), max(0.0, min(1.0, a))
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    m = re.fullmatch(r"#?([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})", s)
+    if m:
+        h = m.group(1)
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        a = int(h[6:8], 16) / 255.0 if len(h) == 8 else 1.0
+        return "#" + h[:6], a
+    m = re.fullmatch(r"rgba?\(\s*([^)]*)\)", s)
+    if m:
+        parts = [p for p in re.split(r"[,\s/]+", m.group(1)) if p]
+        try:
+            nums = [float(p.rstrip("%")) * (2.55 if p.endswith("%") else 1.0) for p in parts[:3]]
+            a = float(parts[3]) if len(parts) > 3 else 1.0
+        except Exception:
+            return None
+        if a > 1.0:
+            a = a / 255.0
+        return to_hex([int(v + 0.5) for v in nums]), max(0.0, min(1.0, a))
+    return None
